@@ -1,20 +1,45 @@
-name: Build Toolchain aarch64 (Flexible, non-GKI)
+name: Build Toolchain aarch64 (Flexible + Presets, non-GKI, GKI)
+
+# Preset dipetakan dari daftar toolchain (4.9 s/d 6.1+).
+# Toolchain asli berformat x86_64, jadi di sini dibuild ulang native arm64
+# dengan versi LLVM terdekat. Toolchain khusus vendor (Samsung CFP/JOPP, Snapdragon LLVM)
+# tidak bisa direproduksi persis dari LLVM upstream: lihat catatan tiap preset.
 
 on:
   workflow_dispatch:
     inputs:
-      # ---------- LLVM ----------
+      preset:
+        description: "Preset siap pakai. Selain 'custom', input LLVM/binutils/llvmgold/bundle di bawah diabaikan"
+        type: choice
+        default: "custom"
+        options:
+          - custom
+          - sm8250-4.19-proton13
+          - 4.9-proton12
+          - 4.9-clang-r416183b
+          - 4.14-stock
+          - 4.14-aosp-lineage
+          - 4.14-samsung-knox
+          - 4.14-samsung-noknox
+          - 4.19-stock
+          - 4.19-alt-r383902
+          - 5.4-qgki
+          - "5.10"
+          - "5.15"
+          - 6.1-plus
+          - mediatek-4.9-5.4
+      # ---------- LLVM (dipakai bila preset = custom) ----------
       llvm_ref:
         description: "LLVM tag/branch/commit (contoh: llvmorg-13.0.1, release/14.x, main, <sha>)"
         default: "llvmorg-13.0.1"
       llvm_repo:
-        description: "Repo llvm-project (bisa fork/patched)"
+        description: "Repo llvm-project (bisa fork/patched). Dipakai juga oleh preset"
         default: "https://github.com/llvm/llvm-project.git"
       llvm_projects:
         description: "LLVM_ENABLE_PROJECTS (contoh: clang;lld;compiler-rt;polly)"
         default: "clang;lld"
       llvm_targets:
-        description: "LLVM_TARGETS_TO_BUILD (contoh: AArch64;ARM atau X86;AArch64;ARM)"
+        description: "LLVM_TARGETS_TO_BUILD (contoh: AArch64;ARM)"
         default: "AArch64;ARM"
       build_type:
         description: "CMAKE_BUILD_TYPE"
@@ -40,7 +65,7 @@ on:
       link_jobs:
         description: "LLVM_PARALLEL_LINK_JOBS (turunkan ke 1 kalau OOM)"
         default: "2"
-      # ---------- GNU binutils ----------
+      # ---------- GNU binutils / GCC (dipakai bila preset = custom) ----------
       binutils_version:
         description: "Versi GNU binutils, atau 'none' untuk skip"
         default: "2.37"
@@ -51,6 +76,13 @@ on:
         description: "Build LLVMgold.so (perlu bila kernel pakai LTO_CLANG)"
         type: boolean
         default: true
+      bundle_arm_gnu:
+        description: "Sertakan ARM GNU toolchain (GCC, host aarch64) ke dalam paket"
+        type: boolean
+        default: false
+      arm_gnu_version:
+        description: "Versi ARM GNU toolchain (dipakai bila bundle aktif, juga oleh preset)"
+        default: "14.2.rel1"
       # ---------- Lingkungan & output ----------
       runner:
         description: "Runner arm64 (22.04 = glibc 2.35, lebih kompatibel di proot)"
@@ -82,19 +114,22 @@ jobs:
     timeout-minutes: 355
 
     env:
-      LLVM_REF: ${{ inputs.llvm_ref }}
+      IN_PRESET: ${{ inputs.preset }}
+      IN_LLVM_REF: ${{ inputs.llvm_ref }}
+      IN_LLVM_PROJECTS: ${{ inputs.llvm_projects }}
+      IN_LLVM_TARGETS: ${{ inputs.llvm_targets }}
+      IN_BINUTILS_VERSION: ${{ inputs.binutils_version }}
+      IN_BINUTILS_TARGETS: ${{ inputs.binutils_targets }}
+      IN_WITH_GOLD: ${{ inputs.llvmgold }}
+      IN_BUNDLE_ARM_GNU: ${{ inputs.bundle_arm_gnu }}
       LLVM_REPO: ${{ inputs.llvm_repo }}
-      LLVM_PROJECTS: ${{ inputs.llvm_projects }}
-      LLVM_TARGETS: ${{ inputs.llvm_targets }}
       BUILD_TYPE: ${{ inputs.build_type }}
       HOST_CC: ${{ inputs.host_cc }}
       STATIC_LIBCXX: ${{ inputs.static_libcxx }}
       BINUTILS_SYMLINKS: ${{ inputs.llvm_binutils_symlinks }}
       EXTRA_CMAKE_ARGS: ${{ inputs.extra_cmake_args }}
       LINK_JOBS: ${{ inputs.link_jobs }}
-      BINUTILS_VERSION: ${{ inputs.binutils_version }}
-      BINUTILS_TARGETS: ${{ inputs.binutils_targets }}
-      WITH_GOLD: ${{ inputs.llvmgold }}
+      ARM_GNU_VERSION: ${{ inputs.arm_gnu_version }}
       EXTRA_APT: ${{ inputs.extra_apt }}
       PKG_NAME: ${{ inputs.pkg_name }}
       PKG_FORMAT: ${{ inputs.pkg_format }}
@@ -103,6 +138,107 @@ jobs:
       - name: Cek lingkungan
         run: |
           uname -m; nproc; free -h; ldd --version | head -n1
+
+      - name: Resolve preset
+        run: |
+          # Mulai dari input manual
+          LLVM_REF="$IN_LLVM_REF"; LLVM_PROJECTS="$IN_LLVM_PROJECTS"; LLVM_TARGETS="$IN_LLVM_TARGETS"
+          BINUTILS_VERSION="$IN_BINUTILS_VERSION"; BINUTILS_TARGETS="$IN_BINUTILS_TARGETS"
+          WITH_GOLD="$IN_WITH_GOLD"; BUNDLE_ARM_GNU="$IN_BUNDLE_ARM_GNU"
+          NOTE=""; USAGE=""
+
+          # set_p <llvm_ref> <binutils_version|none> <llvmgold> <bundle_arm_gnu>
+          set_p() {
+            LLVM_REF="$1"; BINUTILS_VERSION="$2"; WITH_GOLD="$3"; BUNDLE_ARM_GNU="$4"
+            LLVM_PROJECTS="clang;lld"; LLVM_TARGETS="AArch64;ARM"
+            BINUTILS_TARGETS="aarch64-linux-gnu arm-linux-gnueabi"
+          }
+
+          read -r -d '' USAGE_GNU <<'EOF' || true
+          # Gaya "Clang + GNU binutils" (kernel stock/OEM lama). TC = folder paket ini.
+          make O=out ARCH=arm64 <defconfig>
+          make -j4 O=out ARCH=arm64 CC=clang \
+            CROSS_COMPILE=$TC/bin/aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=$TC/bin/arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu-
+          # Bila paket menyertakan gcc-arm/, CROSS_COMPILE bisa diganti:
+          #   CROSS_COMPILE=$TC/gcc-arm/bin/aarch64-none-linux-gnu-
+          EOF
+
+          read -r -d '' USAGE_LLVM <<'EOF' || true
+          # Gaya "Clang only" (LLVM=1). Tidak butuh GCC.
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 <defconfig>
+          make -j4 O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
+          # 5.10: skrip upstream tetap memberi CROSS_COMPILE=aarch64-linux-gnu- (hanya triple untuk Clang).
+          # 5.15 / 6.1+: tanpa CROSS_COMPILE.
+          EOF
+
+          case "$IN_PRESET" in
+            custom) ;;
+            sm8250-4.19-proton13)
+              set_p llvmorg-13.0.1 2.37 true false; USAGE="$USAGE_GNU"
+              NOTE="Setara Proton clang 13 (20210522) untuk kernel_xiaomi_sm8250_mod. Taruh di ~/proton-clang/proton-clang-20210522" ;;
+            4.9-proton12)
+              set_p llvmorg-12.0.1 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: proton-12 + linaro-aarch64-7.5. Linaro 7.5 hanya x86_64, diganti ARM GNU (sejak 21 Mar 2025 skrip 4.9-5.4 memakai ARM GNU sebagai CROSS_COMPILE)." ;;
+            4.9-clang-r416183b)
+              set_p llvmorg-12.0.1 2.37 false false; USAGE="$USAGE_GNU"
+              NOTE="README: clang-r416183b yang membawa aarch64-linux-gnu- sendiri. Di sini binutils aarch64-linux-gnu-/arm-linux-gnueabi- ikut dalam bin/: CROSS_COMPILE=\$TC/bin/aarch64-linux-gnu- dan CC=\$TC/bin/clang." ;;
+            4.14-stock)
+              set_p llvmorg-11.1.0 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: clang-r383902b + arm-gnu-toolchain-14.2.rel1 (common 4.14, misal realme). Tag terdekat: LLVM 11.1.0." ;;
+            4.14-aosp-lineage)
+              set_p llvmorg-18.1.8 none false false; USAGE="$USAGE_LLVM"
+              NOTE="README: neutron-clang, Clang only untuk sumber AOSP/LineageOS (4.14.355). README bilang Clang terbaru manapun cukup; dipakai LLVM 18.1.8. Bila LLVM=1 gagal, tree tidak dipatch: pakai preset 4.14-stock." ;;
+            4.14-samsung-knox)
+              set_p llvmorg-10.0.1 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: clang-4639204-cfp-jopp + gcc-cfp-jopp-only (Galaxy S10x). Toolchain itu bawaan Samsung dengan patch CFP/JOPP: build vanilla ini TIDAK mengaktifkan fitur tersebut. Hanya pendekatan terdekat." ;;
+            4.14-samsung-noknox)
+              set_p llvmorg-10.0.1 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: clang-4639204 + aarch64-linux-android-4.9 (Galaxy M21). Toolchain asli hanya x86_64; diganti LLVM 10.0.1 + ARM GNU. Pendekatan terdekat, bukan identik." ;;
+            4.19-stock)
+              set_p llvmorg-9.0.1 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: clang-r353983c + arm-gnu-toolchain-14.2.rel1 (4.19.198). Tag terdekat: LLVM 9.0.1 (LLVM lama, rawan gagal compile; bila gagal pakai 4.19-alt-r383902)." ;;
+            4.19-alt-r383902)
+              set_p llvmorg-11.1.0 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: clang-r383902 + ARM GNU (4.19.191). Tag terdekat: LLVM 11.1.0." ;;
+            5.4-qgki)
+              set_p llvmorg-10.0.1 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: llvm-arm-toolchain-ship-10.0.9 (Snapdragon LLVM) + ARM GNU. Snapdragon LLVM bersifat tertutup; diganti LLVM 10.0.1 upstream (tidak butuh libtinfo.so.5)." ;;
+            5.10)
+              set_p llvmorg-12.0.1 none false false; USAGE="$USAGE_LLVM"
+              NOTE="README: clang-r416183b, Clang only (5.10.198). Tag terdekat: LLVM 12.0.1." ;;
+            5.15)
+              set_p llvmorg-14.0.6 none false false; USAGE="$USAGE_LLVM"
+              NOTE="README: clang-r450784e, Clang only, tanpa CROSS_COMPILE (5.15.123-149). Tag terdekat: LLVM 14.0.6." ;;
+            6.1-plus)
+              set_p llvmorg-17.0.6 none false false; USAGE="$USAGE_LLVM"
+              NOTE="README: clang-r510928, Clang only, tanpa CROSS_COMPILE. Toolchain ini juga bisa membuild 5.15. Tag terdekat: LLVM 17.0.6." ;;
+            mediatek-4.9-5.4)
+              set_p llvmorg-12.0.1 2.37 false true; USAGE="$USAGE_GNU"
+              NOTE="README: untuk MediaTek 4.9-5.4 pakai ARM GNU bersama Clang yang layak. MediaTek biasanya tidak bisa boot Image mentah: build Image.gz (KERNEL_IMAGE=Image.gz)." ;;
+            *) echo "Preset tidak dikenal: $IN_PRESET"; exit 1 ;;
+          esac
+
+          {
+            echo "LLVM_REF=$LLVM_REF"
+            echo "LLVM_PROJECTS=$LLVM_PROJECTS"
+            echo "LLVM_TARGETS=$LLVM_TARGETS"
+            echo "BINUTILS_VERSION=$BINUTILS_VERSION"
+            echo "BINUTILS_TARGETS=$BINUTILS_TARGETS"
+            echo "WITH_GOLD=$WITH_GOLD"
+            echo "BUNDLE_ARM_GNU=$BUNDLE_ARM_GNU"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "preset: $IN_PRESET"
+            [ -n "$NOTE" ] && echo "catatan: $NOTE"
+            echo
+            [ -n "$USAGE" ] && echo "$USAGE"
+          } > preset-info.txt
+          cat preset-info.txt
+          echo "== hasil resolve =="
+          echo "llvm=$LLVM_REF binutils=$BINUTILS_VERSION gold=$WITH_GOLD arm_gnu=$BUNDLE_ARM_GNU"
 
       - name: Install dependensi
         run: |
@@ -114,8 +250,10 @@ jobs:
           sudo ln -sf /usr/bin/ld.lld-14 /usr/local/bin/ld.lld
 
       - name: Build GNU binutils
-        if: ${{ inputs.binutils_version != 'none' && inputs.binutils_version != '' }}
         run: |
+          if [ "$BINUTILS_VERSION" = "none" ] || [ -z "$BINUTILS_VERSION" ]; then
+            echo "binutils dilewati"; exit 0
+          fi
           PREFIX="$PWD/install"
           V="$BINUTILS_VERSION"
           curl -L --fail -o binutils.tar.xz "https://ftp.gnu.org/gnu/binutils/binutils-$V.tar.xz" \
@@ -151,9 +289,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
-          key: ccache-flex-${{ inputs.llvm_ref }}-${{ github.run_id }}
+          key: ccache-flex-${{ inputs.preset }}-${{ inputs.llvm_ref }}-${{ github.run_id }}
           restore-keys: |
-            ccache-flex-${{ inputs.llvm_ref }}-
+            ccache-flex-${{ inputs.preset }}-${{ inputs.llvm_ref }}-
 
       - name: Configure LLVM
         run: |
@@ -190,6 +328,13 @@ jobs:
             ARGS+=(-DCMAKE_C_COMPILER=clang-14 -DCMAKE_CXX_COMPILER=clang++-14)
           fi
 
+          # LLVM <= 11 sering kehilangan include (cstdint/limits) di libstdc++ baru
+          MAJOR="$(echo "$LLVM_REF" | grep -oE '[0-9]+' | head -n1 || true)"
+          if [ -n "$MAJOR" ] && [ ${#MAJOR} -le 2 ] && [ "$MAJOR" -le 11 ]; then
+            echo "LLVM <= 11 terdeteksi: tambah flag kompatibilitas C++"
+            ARGS+=(-DCMAKE_CXX_FLAGS="-include cstdint -include limits")
+          fi
+
           if [ "$WITH_GOLD" = "true" ]; then
             if [ -d "binutils-$BINUTILS_VERSION/include" ]; then
               INC="$PWD/binutils-$BINUTILS_VERSION/include"
@@ -209,17 +354,27 @@ jobs:
 
       - name: Build dan install LLVM (stripped)
         run: |
-          cmake --build build --target install-stripped
+          cmake --build build
+          cmake --install build --strip
+      - name: Sertakan ARM GNU toolchain (GCC, host aarch64)
+        run: |
+          if [ "$BUNDLE_ARM_GNU" != "true" ]; then echo "dilewati"; exit 0; fi
+          V="$ARM_GNU_VERSION"
+          F="arm-gnu-toolchain-$V-aarch64-aarch64-none-linux-gnu.tar.xz"
+          curl -L --fail -A "Mozilla/5.0" -o "$F" \
+            "https://developer.arm.com/-/media/Files/downloads/gnu/$V/binrel/$F"
+          mkdir -p install/gcc-arm
+          tar -xf "$F" -C install/gcc-arm --strip-components=1
+          install/gcc-arm/bin/aarch64-none-linux-gnu-gcc --version | head -n1
 
       - name: Test
         run: |
           export PATH="$PWD/install/bin:$PATH"
           clang --version
           ld.lld --version || true
-          for T in $BINUTILS_TARGETS; do
-            [ "$BINUTILS_VERSION" = "none" ] && break
-            "$T-ld" --version | head -n1
-          done
+          if [ "$BINUTILS_VERSION" != "none" ]; then
+            for T in $BINUTILS_TARGETS; do "$T-ld" --version | head -n1; done
+          fi
           echo 'int add(int a,int b){return a+b;}' > /tmp/t.c
           TARGETS_AVAIL="$(clang --print-targets)"
           echo "$TARGETS_AVAIL" | grep -qi aarch64 && \
@@ -228,26 +383,34 @@ jobs:
             clang --target=arm-linux-gnueabi -ffreestanding -c /tmp/t.c -o /tmp/t32.o && echo "arm OK"
           ls install/lib/LLVMgold.so 2>/dev/null || echo "(LLVMgold.so tidak ada)"
 
-      - name: Tulis VERSION.txt
+      - name: Tulis VERSION.txt dan PRESET.txt
         run: |
           {
+            echo "preset=$IN_PRESET"
             echo "llvm_repo=$LLVM_REPO"
             echo "llvm_ref=$LLVM_REF"
             echo "llvm_commit=$(git -C llvm-project rev-parse HEAD)"
             echo "projects=$LLVM_PROJECTS"
             echo "targets=$LLVM_TARGETS"
             echo "binutils=$BINUTILS_VERSION ($BINUTILS_TARGETS)"
+            echo "arm_gnu_bundled=$BUNDLE_ARM_GNU ($ARM_GNU_VERSION)"
             echo "build_type=$BUILD_TYPE host_cc=$HOST_CC"
             echo "extra_cmake_args=$EXTRA_CMAKE_ARGS"
             echo "runner_glibc=$(ldd --version | head -n1)"
           } > install/VERSION.txt
+          cp preset-info.txt install/PRESET.txt
           cat install/VERSION.txt
 
       - name: Package
         id: pkg
         run: |
           REF_SAFE="$(echo "${LLVM_REF#llvmorg-}" | tr '/ ' '--')"
-          NAME="${PKG_NAME}-${REF_SAFE}-aarch64"
+          PRE_SAFE="$(echo "$IN_PRESET" | tr '/ ' '--')"
+          if [ "$IN_PRESET" = "custom" ]; then
+            NAME="${PKG_NAME}-${REF_SAFE}-aarch64"
+          else
+            NAME="${PKG_NAME}-${PRE_SAFE}-${REF_SAFE}-aarch64"
+          fi
           mv install "$NAME"
           case "$PKG_FORMAT" in
             tar.xz)  tar -cf - "$NAME" | xz -T0 -6 > "$NAME.tar.xz" ;;
@@ -263,6 +426,26 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ccache
+          key: ccache-flex-${{ inputs.preset }}-${{ inputs.llvm_ref }}-${{ github.run_id }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.file }}
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload ke Releases
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.pkg.outputs.name }}-${{ github.run_number }}"
+          gh release create "$TAG" "${{ steps.pkg.outputs.file }}" \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes-file "${{ steps.pkg.outputs.name }}/VERSION.txt"
+path: ~/.ccache
           key: ccache-flex-${{ inputs.llvm_ref }}-${{ github.run_id }}
 
       - name: Upload artifact
