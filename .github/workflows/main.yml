@@ -1,0 +1,285 @@
+name: Build Toolchain aarch64 (Flexible, non-GKI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ---------- LLVM ----------
+      llvm_ref:
+        description: "LLVM tag/branch/commit (contoh: llvmorg-13.0.1, release/14.x, main, <sha>)"
+        default: "llvmorg-13.0.1"
+      llvm_repo:
+        description: "Repo llvm-project (bisa fork/patched)"
+        default: "https://github.com/llvm/llvm-project.git"
+      llvm_projects:
+        description: "LLVM_ENABLE_PROJECTS (contoh: clang;lld;compiler-rt;polly)"
+        default: "clang;lld"
+      llvm_targets:
+        description: "LLVM_TARGETS_TO_BUILD (contoh: AArch64;ARM atau X86;AArch64;ARM)"
+        default: "AArch64;ARM"
+      build_type:
+        description: "CMAKE_BUILD_TYPE"
+        type: choice
+        default: "Release"
+        options: [Release, MinSizeRel, RelWithDebInfo]
+      host_cc:
+        description: "Compiler untuk build LLVM (clang lebih aman untuk LLVM lama)"
+        type: choice
+        default: "clang"
+        options: [clang, gcc]
+      static_libcxx:
+        description: "Link libstdc++ statis (lebih portabel)"
+        type: boolean
+        default: true
+      llvm_binutils_symlinks:
+        description: "Pasang symlink ar/nm/objcopy/... ke llvm-* di bin/ (bisa menimpa tool host)"
+        type: boolean
+        default: false
+      extra_cmake_args:
+        description: "Argumen cmake tambahan, pisahkan spasi (contoh: -DLLVM_ENABLE_LTO=Thin)"
+        default: ""
+      link_jobs:
+        description: "LLVM_PARALLEL_LINK_JOBS (turunkan ke 1 kalau OOM)"
+        default: "2"
+      # ---------- GNU binutils ----------
+      binutils_version:
+        description: "Versi GNU binutils, atau 'none' untuk skip"
+        default: "2.37"
+      binutils_targets:
+        description: "Target binutils, pisahkan spasi"
+        default: "aarch64-linux-gnu arm-linux-gnueabi"
+      llvmgold:
+        description: "Build LLVMgold.so (perlu bila kernel pakai LTO_CLANG)"
+        type: boolean
+        default: true
+      # ---------- Lingkungan & output ----------
+      runner:
+        description: "Runner arm64 (22.04 = glibc 2.35, lebih kompatibel di proot)"
+        type: choice
+        default: "ubuntu-22.04-arm"
+        options: [ubuntu-22.04-arm, ubuntu-24.04-arm]
+      extra_apt:
+        description: "Paket apt tambahan (opsional)"
+        default: ""
+      pkg_name:
+        description: "Awalan nama paket"
+        default: "clang"
+      pkg_format:
+        description: "Format arsip"
+        type: choice
+        default: "tar.xz"
+        options: [tar.xz, tar.zst, tar.gz]
+      create_release:
+        description: "Upload juga ke GitHub Releases"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+
+    env:
+      LLVM_REF: ${{ inputs.llvm_ref }}
+      LLVM_REPO: ${{ inputs.llvm_repo }}
+      LLVM_PROJECTS: ${{ inputs.llvm_projects }}
+      LLVM_TARGETS: ${{ inputs.llvm_targets }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      HOST_CC: ${{ inputs.host_cc }}
+      STATIC_LIBCXX: ${{ inputs.static_libcxx }}
+      BINUTILS_SYMLINKS: ${{ inputs.llvm_binutils_symlinks }}
+      EXTRA_CMAKE_ARGS: ${{ inputs.extra_cmake_args }}
+      LINK_JOBS: ${{ inputs.link_jobs }}
+      BINUTILS_VERSION: ${{ inputs.binutils_version }}
+      BINUTILS_TARGETS: ${{ inputs.binutils_targets }}
+      WITH_GOLD: ${{ inputs.llvmgold }}
+      EXTRA_APT: ${{ inputs.extra_apt }}
+      PKG_NAME: ${{ inputs.pkg_name }}
+      PKG_FORMAT: ${{ inputs.pkg_format }}
+
+    steps:
+      - name: Cek lingkungan
+        run: |
+          uname -m; nproc; free -h; ldd --version | head -n1
+
+      - name: Install dependensi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 git ccache \
+            clang-14 lld-14 zlib1g-dev xz-utils zstd curl ca-certificates \
+            texinfo bison flex m4 file binutils-dev $EXTRA_APT
+          sudo ln -sf /usr/bin/ld.lld-14 /usr/local/bin/ld.lld
+
+      - name: Build GNU binutils
+        if: ${{ inputs.binutils_version != 'none' && inputs.binutils_version != '' }}
+        run: |
+          PREFIX="$PWD/install"
+          V="$BINUTILS_VERSION"
+          curl -L --fail -o binutils.tar.xz "https://ftp.gnu.org/gnu/binutils/binutils-$V.tar.xz" \
+            || curl -L --fail -o binutils.tar.xz "https://ftpmirror.gnu.org/binutils/binutils-$V.tar.xz"
+          tar -xf binutils.tar.xz
+          for T in $BINUTILS_TARGETS; do
+            echo "=== binutils untuk $T ==="
+            mkdir -p "build-binutils-$T"
+            ( cd "build-binutils-$T" && \
+              "../binutils-$V/configure" \
+                --target="$T" --prefix="$PREFIX" \
+                --disable-nls --disable-werror --disable-gdb --disable-sim \
+                --disable-gdbserver --disable-readline --disable-multilib \
+                --enable-gold --enable-plugins --enable-deterministic-archives \
+                --with-system-zlib \
+                MAKEINFO=true \
+                LDFLAGS="-static-libstdc++ -static-libgcc" && \
+              make -j"$(nproc)" MAKEINFO=true && \
+              make install-strip MAKEINFO=true )
+          done
+          ls "$PREFIX/bin"
+
+      - name: Ambil source LLVM
+        run: |
+          mkdir llvm-project && cd llvm-project
+          git init -q
+          git remote add origin "$LLVM_REPO"
+          git fetch --depth 1 origin "$LLVM_REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-flex-${{ inputs.llvm_ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-flex-${{ inputs.llvm_ref }}-
+
+      - name: Configure LLVM
+        run: |
+          ccache --max-size=3G
+          onoff() { [ "$1" = "true" ] && echo ON || echo OFF; }
+
+          ARGS=(-G Ninja -S llvm-project/llvm -B build
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+            -DCMAKE_INSTALL_PREFIX="$PWD/install"
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DLLVM_USE_LINKER=lld
+            -DLLVM_ENABLE_PROJECTS="$LLVM_PROJECTS"
+            -DLLVM_TARGETS_TO_BUILD="$LLVM_TARGETS"
+            -DLLVM_ENABLE_ASSERTIONS=OFF
+            -DLLVM_INCLUDE_TESTS=OFF
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
+            -DLLVM_INCLUDE_DOCS=OFF
+            -DCLANG_INCLUDE_TESTS=OFF
+            -DLLVM_INSTALL_BINUTILS_SYMLINKS="$(onoff "$BINUTILS_SYMLINKS")"
+            -DLLVM_ENABLE_ZLIB=ON
+            -DLLVM_ENABLE_ZSTD=OFF
+            -DLLVM_ENABLE_LIBXML2=OFF
+            -DLLVM_ENABLE_TERMINFO=OFF
+            -DLLVM_STATIC_LINK_CXX_STDLIB="$(onoff "$STATIC_LIBCXX")"
+            -DLLVM_PARALLEL_LINK_JOBS="$LINK_JOBS"
+            -DCLANG_ENABLE_ARCMT=OFF
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF)
+
+          if [ "$HOST_CC" = "gcc" ]; then
+            ARGS+=(-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++)
+          else
+            ARGS+=(-DCMAKE_C_COMPILER=clang-14 -DCMAKE_CXX_COMPILER=clang++-14)
+          fi
+
+          if [ "$WITH_GOLD" = "true" ]; then
+            if [ -d "binutils-$BINUTILS_VERSION/include" ]; then
+              INC="$PWD/binutils-$BINUTILS_VERSION/include"
+            else
+              INC=/usr/include   # plugin-api.h dari paket binutils-dev
+            fi
+            ARGS+=(-DLLVM_BINUTILS_INCDIR="$INC")
+          fi
+
+          if [ -n "$EXTRA_CMAKE_ARGS" ]; then
+            read -r -a EXTRA <<< "$EXTRA_CMAKE_ARGS"
+            ARGS+=("${EXTRA[@]}")
+          fi
+
+          printf '%s\n' "${ARGS[@]}"
+          cmake "${ARGS[@]}"
+
+      - name: Build dan install LLVM (stripped)
+        run: |
+          cmake --build build --target install-stripped
+
+      - name: Test
+        run: |
+          export PATH="$PWD/install/bin:$PATH"
+          clang --version
+          ld.lld --version || true
+          for T in $BINUTILS_TARGETS; do
+            [ "$BINUTILS_VERSION" = "none" ] && break
+            "$T-ld" --version | head -n1
+          done
+          echo 'int add(int a,int b){return a+b;}' > /tmp/t.c
+          TARGETS_AVAIL="$(clang --print-targets)"
+          echo "$TARGETS_AVAIL" | grep -qi aarch64 && \
+            clang --target=aarch64-linux-gnu -ffreestanding -c /tmp/t.c -o /tmp/t64.o && echo "aarch64 OK"
+          echo "$TARGETS_AVAIL" | grep -qiw arm && \
+            clang --target=arm-linux-gnueabi -ffreestanding -c /tmp/t.c -o /tmp/t32.o && echo "arm OK"
+          ls install/lib/LLVMgold.so 2>/dev/null || echo "(LLVMgold.so tidak ada)"
+
+      - name: Tulis VERSION.txt
+        run: |
+          {
+            echo "llvm_repo=$LLVM_REPO"
+            echo "llvm_ref=$LLVM_REF"
+            echo "llvm_commit=$(git -C llvm-project rev-parse HEAD)"
+            echo "projects=$LLVM_PROJECTS"
+            echo "targets=$LLVM_TARGETS"
+            echo "binutils=$BINUTILS_VERSION ($BINUTILS_TARGETS)"
+            echo "build_type=$BUILD_TYPE host_cc=$HOST_CC"
+            echo "extra_cmake_args=$EXTRA_CMAKE_ARGS"
+            echo "runner_glibc=$(ldd --version | head -n1)"
+          } > install/VERSION.txt
+          cat install/VERSION.txt
+
+      - name: Package
+        id: pkg
+        run: |
+          REF_SAFE="$(echo "${LLVM_REF#llvmorg-}" | tr '/ ' '--')"
+          NAME="${PKG_NAME}-${REF_SAFE}-aarch64"
+          mv install "$NAME"
+          case "$PKG_FORMAT" in
+            tar.xz)  tar -cf - "$NAME" | xz -T0 -6 > "$NAME.tar.xz" ;;
+            tar.zst) tar -cf - "$NAME" | zstd -T0 -19 > "$NAME.tar.zst" ;;
+            tar.gz)  tar -czf "$NAME.tar.gz" "$NAME" ;;
+          esac
+          ls -lh "$NAME.$PKG_FORMAT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "file=$NAME.$PKG_FORMAT" >> "$GITHUB_OUTPUT"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-flex-${{ inputs.llvm_ref }}-${{ github.run_id }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.file }}
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload ke Releases
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.pkg.outputs.name }}-${{ github.run_number }}"
+          gh release create "$TAG" "${{ steps.pkg.outputs.file }}" \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes-file "$(ls -d "${{ steps.pkg.outputs.name }}")/VERSION.txt"
+            
