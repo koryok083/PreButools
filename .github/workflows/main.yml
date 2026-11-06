@@ -376,11 +376,18 @@ jobs:
             for T in $BINUTILS_TARGETS; do "$T-ld" --version | head -n1; done
           fi
           echo 'int add(int a,int b){return a+b;}' > /tmp/t.c
-          TARGETS_AVAIL="$(clang --print-targets)"
-          echo "$TARGETS_AVAIL" | grep -qi aarch64 && \
-            clang --target=aarch64-linux-gnu -ffreestanding -c /tmp/t.c -o /tmp/t64.o && echo "aarch64 OK"
-          echo "$TARGETS_AVAIL" | grep -qiw arm && \
-            clang --target=arm-linux-gnueabi -ffreestanding -c /tmp/t.c -o /tmp/t32.o && echo "arm OK"
+          # Cek target lewat compile langsung (kompatibel LLVM lama; tanpa --print-targets)
+          T_LOW="$(echo ";$LLVM_TARGETS;" | tr 'A-Z' 'a-z')"
+          case "$T_LOW" in
+            *";aarch64;"*)
+              clang --target=aarch64-linux-gnu -ffreestanding -c /tmp/t.c -o /tmp/t64.o
+              echo "aarch64 OK" ;;
+          esac
+          case "$T_LOW" in
+            *";arm;"*)
+              clang --target=arm-linux-gnueabi -ffreestanding -c /tmp/t.c -o /tmp/t32.o
+              echo "arm OK" ;;
+          esac
           ls install/lib/LLVMgold.so 2>/dev/null || echo "(LLVMgold.so tidak ada)"
 
       - name: Tulis VERSION.txt dan PRESET.txt
